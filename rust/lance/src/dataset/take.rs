@@ -18,7 +18,7 @@ use lance_arrow::RecordBatchExt;
 use lance_core::datatypes::Schema;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::deletion::OffsetMapper;
-use lance_core::ROW_ADDR;
+use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
 use lance_datafusion::projection::ProjectionPlan;
 use snafu::location;
 
@@ -106,7 +106,6 @@ pub async fn take(
     projection: ProjectionRequest,
 ) -> Result<RecordBatch> {
     let projection = projection.into_projection_plan(Arc::new(dataset.clone()))?;
-
     if offsets.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(
             projection.output_schema()?,
@@ -130,6 +129,9 @@ async fn do_take_rows(
     mut builder: TakeBuilder,
     projection: Arc<ProjectionPlan>,
 ) -> Result<RecordBatch> {
+    let with_row_id = projection.physical_projection.with_row_id;
+    let with_row_addr = projection.physical_projection.with_row_addr;
+
     let row_addrs = builder.get_row_addrs().await?.clone();
 
     if row_addrs.is_empty() {
@@ -149,18 +151,27 @@ async fn do_take_rows(
         fragment: FileFragment,
         row_offsets: Vec<u32>,
         projection: Arc<Schema>,
+        with_row_id: bool,
         with_row_addresses: bool,
     ) -> impl Future<Output = Result<RecordBatch>> + Send {
         async move {
             fragment
-                .take_rows(&row_offsets, projection.as_ref(), with_row_addresses)
+                .take_rows(
+                    &row_offsets,
+                    projection.as_ref(),
+                    with_row_id,
+                    with_row_addresses,
+                )
                 .await
         }
     }
 
     let physical_schema = Arc::new(projection.physical_projection.to_bare_schema());
+    println!("111");
 
     let batch = if row_addr_stats.contiguous {
+        println!("222");
+
         // Fastest path: Can use `read_range` directly
         let start = row_addrs.first().expect("empty range passed to take_rows");
         let fragment_id = (start >> 32) as usize;
@@ -175,12 +186,19 @@ async fn do_take_rows(
             )
         })?;
 
-        let reader = fragment
-            .open(&physical_schema, FragReadConfig::default())
-            .await?;
+        let mut read_config = FragReadConfig::default();
+        if with_row_id {
+            read_config.with_row_id = true;
+        }
+        if with_row_addr {
+            read_config.with_row_address = true;
+        }
+
+        let reader = fragment.open(&physical_schema, read_config).await?;
         reader.legacy_read_range_as_batch(range).await
     } else if row_addr_stats.sorted {
         // Don't need to re-arrange data, just concatenate
+        println!("333");
 
         let mut batches: Vec<_> = Vec::new();
         let mut current_fragment = row_addrs[0] >> 32;
@@ -219,7 +237,13 @@ async fn do_take_rows(
                 })?;
             let row_offsets: Vec<u32> = row_addrs[range].iter().map(|x| *x as u32).collect();
 
-            let batch_fut = do_take(fragment, row_offsets, physical_schema.clone(), false);
+            let batch_fut = do_take(
+                fragment,
+                row_offsets,
+                physical_schema.clone(),
+                with_row_id,
+                with_row_addr,
+            );
             batches.push(batch_fut);
         }
         let batches: Vec<RecordBatch> = futures::stream::iter(batches)
@@ -228,13 +252,11 @@ async fn do_take_rows(
             .await?;
         Ok(concat_batches(&batches[0].schema(), &batches)?)
     } else {
+        println!("444");
+
         let projection_with_row_addr = Schema::merge(
             physical_schema.as_ref(),
-            &ArrowSchema::new(vec![ArrowField::new(
-                ROW_ADDR,
-                arrow::datatypes::DataType::UInt64,
-                false,
-            )]),
+            &ArrowSchema::new(vec![ROW_ADDR_FIELD.clone()]),
         )?;
         let schema_with_row_addr = Arc::new(ArrowSchema::from(&projection_with_row_addr));
 
@@ -262,16 +284,26 @@ async fn do_take_rows(
         });
 
         let mut batches = futures::stream::iter(fragment_and_indices)
-            .map(|(fragment, indices)| do_take(fragment, indices, physical_schema.clone(), true))
+            .map(|(fragment, indices)| {
+                do_take(
+                    fragment,
+                    indices,
+                    physical_schema.clone(),
+                    with_row_id,
+                    true,
+                )
+            })
             .buffered(builder.dataset.object_store.io_parallelism())
             .try_collect::<Vec<_>>()
             .await?;
+        println!("batches:{:?}", batches);
 
         let one_batch = if batches.len() > 1 {
             concat_batches(&schema_with_row_addr, &batches)?
         } else {
             batches.pop().unwrap()
         };
+        println!("one_batch:{:?}", one_batch);
         // Note: one_batch may contains fewer rows than the number of requested
         // row ids because some rows may have been deleted. Because of this, we
         // get the results with row ids so that we can re-order the results
@@ -301,8 +333,8 @@ async fn do_take_rows(
         debug_assert!(remapping_index.len() >= one_batch.num_rows());
 
         // Remove the rowaddr column.
-        let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
-        let one_batch = one_batch.project(&keep_indices)?;
+        // let keep_indices = (0..one_batch.num_columns() - 1).collect::<Vec<_>>();
+        // let one_batch = one_batch.project(&keep_indices)?;
 
         // There's a bug in arrow_select::take::take, that it doesn't handle empty struct correctly,
         // so we need to handle it manually here.
